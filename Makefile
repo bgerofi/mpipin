@@ -1,5 +1,5 @@
 CC?=gcc
-CFLAGS=-O2 -Wall -Wextra
+CFLAGS=-O2 -Wall -Wextra -I./include -I./include/arch/x86/
 LDFLAGS=-lnuma
 
 BINS=mpipin
@@ -7,8 +7,11 @@ BINS=mpipin
 .PHONY: all clean
 all: $(BINS)
 
-%: %.c
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+mpipin: mpipin.o bitmap.o bitops.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $^
 
 clean:
-	rm -rf $(BINS)
+	rm -rf $(BINS) *.o
