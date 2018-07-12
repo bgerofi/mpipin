@@ -14,6 +14,9 @@ static inline int fls(int x)
 	return r + 1;
 }
 
+/*
+ * glibc provides this.
+ */
 #if 0
 /**
  * ffs - find first set bit in word

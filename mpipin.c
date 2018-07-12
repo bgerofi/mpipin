@@ -36,7 +36,6 @@
 #include <getopt.h>
 #include <numa.h>
 #include <numaif.h>
-
 #include <bitmap.h>
 
 int compact = 1;
@@ -147,48 +146,42 @@ out:
 	return error;
 }
 
-#if 0
 int file_readable(char *fmt, ...)
 {
-	int ret;
+	int error;
+	int fd;
 	va_list ap;
 	int n;
 	char *filename = NULL;
-	struct file *fp = NULL;
 
-	filename = kmalloc(PATH_MAX, GFP_KERNEL);
+	filename = malloc(PATH_MAX);
 	if (!filename) {
-		eprintk("%s: kmalloc failed. %d\n",
-				__FUNCTION__, -ENOMEM);
-		ret = 0;
+		error = -ENOMEM;
 		goto out;
 	}
 
 	va_start(ap, fmt);
 	n = vsnprintf(filename, PATH_MAX, fmt, ap);
 	va_end(ap);
-
 	if (n >= PATH_MAX) {
-		eprintk("%s: vsnprintf failed. %d\n",
-				__FUNCTION__, -ENAMETOOLONG);
-		ret = 0;
+		error = -ENAMETOOLONG;
 		goto out;
 	}
 
-	fp = filp_open(filename, O_RDONLY, 0);
-	if (IS_ERR(fp)) {
-		ret = 0;
+	fd = open(filename, 0, O_RDONLY);
+	if (fd < 0) {
+		error = -EINVAL;
 		goto out;
 	}
 
-	filp_close(fp, NULL);
-	ret = 1;
-
+	close(fd);
+	error = 0;
 out:
-	kfree(filename);
-	return ret;
+	if (filename)
+		free(filename);
+
+	return error;
 }
-#endif
 
 int read_long(long *valuep, char *fmt, ...)
 {
@@ -208,6 +201,7 @@ int read_long(long *valuep, char *fmt, ...)
 	error = read_file(buf, PAGE_SIZE - 1, fmt, ap);
 	va_end(ap);
 	if (error) {
+		error = -EINVAL;
 		fprintf(stderr, "%s: error: reading data\n", __FUNCTION__);
 		goto out;
 	}
@@ -225,12 +219,12 @@ out:
 	return error;
 }
 
-int read_bitmap(long *valuep, char *fmt, ...)
+
+int read_bitmap(void *map, int nbits, char *fmt, ...)
 {
 	int error;
 	char *buf = NULL;
 	va_list ap;
-	int n;
 
 	buf = malloc(PAGE_SIZE);
 	if (!buf) {
@@ -243,14 +237,15 @@ int read_bitmap(long *valuep, char *fmt, ...)
 	error = read_file(buf, PAGE_SIZE - 1, fmt, ap);
 	va_end(ap);
 	if (error) {
+		error = -EINVAL;
 		fprintf(stderr, "%s: error: reading data\n", __FUNCTION__);
 		goto out;
 	}
 
-	n = sscanf(buf, "%ld", valuep);
-	if (n != 1) {
-		error = -EIO;
-		fprintf(stderr, "%s: error: interpreting long\n", __FUNCTION__);
+	error = bitmap_parse(buf, PAGE_SIZE, map, nbits);
+	if (error) {
+		error = -EINVAL;
+		fprintf(stderr, "%s: error: parsing bitmap\n", __FUNCTION__);
 		goto out;
 	}
 
@@ -260,41 +255,6 @@ out:
 	return error;
 }
 
-#if 0
-int read_bitmap(void *map, int nbits, char *fmt, ...)
-{
-	int error;
-	char *buf = NULL;
-	va_list ap;
-
-	dprintk("read_bitmap(%p,%d,%s)\n", map, nbits, fmt);
-	buf = (void *)__get_free_pages(GFP_KERNEL, 0);
-	if (!buf) {
-		error = -ENOMEM;
-		eprintk("ihk:read_bitmap:__get_free_pages failed. %d\n", error);
-		goto out;
-	}
-
-	va_start(ap, fmt);
-	error = read_file(buf, PAGE_SIZE, fmt, ap);
-	va_end(ap);
-	if (error) {
-		eprintk("ihk:read_bitmap:read_file failed. %d\n", error);
-		goto out;
-	}
-
-	error = bitmap_parse(buf, PAGE_SIZE, map, nbits);
-	if (error) {
-		eprintk("ihk:read_bitmap:bitmap_parse failed. %d\n", error);
-		goto out;
-	}
-
-	error = 0;
-out:
-	free_pages((long)buf, 0);
-	dprintk("read_bitmap(%p,%d,%s): %d\n", map, nbits, fmt, error);
-	return error;
-} /* read_bitmap() */
 
 int read_string(char **valuep, char *fmt, ...)
 {
@@ -304,27 +264,26 @@ int read_string(char **valuep, char *fmt, ...)
 	char *p = NULL;
 	int len;
 
-	dprintk("read_string(%p,%s)\n", valuep, fmt);
-	buf = (void *)__get_free_pages(GFP_KERNEL, 0);
+	buf = malloc(PAGE_SIZE);
 	if (!buf) {
+		fprintf(stderr, "%s: error: allocating memory\n", __FUNCTION__);
 		error = -ENOMEM;
-		eprintk("ihk:read_string:"
-				"__get_free_pages failed. %d\n", error);
 		goto out;
 	}
 
 	va_start(ap, fmt);
-	error = read_file(buf, PAGE_SIZE, fmt, ap);
+	error = read_file(buf, PAGE_SIZE - 1, fmt, ap);
 	va_end(ap);
 	if (error) {
-		eprintk("ihk:read_string:read_file failed. %d\n", error);
+		error = -EINVAL;
+		fprintf(stderr, "%s: error: reading data\n", __FUNCTION__);
 		goto out;
 	}
 
-	p = kstrdup(buf, GFP_KERNEL);
+	p = strdup(buf);
 	if (!p) {
 		error = -ENOMEM;
-		eprintk("ihk:read_string:kstrdup failed. %d\n", error);
+		fprintf(stderr, "%s: error: allocating memory\n", __FUNCTION__);
 		goto out;
 	}
 
@@ -338,13 +297,9 @@ int read_string(char **valuep, char *fmt, ...)
 	p = NULL;
 
 out:
-	kfree(p);
-	free_pages((long)buf, 0);
-	dprintk("read_string(%p,%s): %d\n", valuep, fmt, error);
+	free(buf);
 	return error;
-} /* read_string() */
-#endif
-
+}
 
 
 int main(int argc, char **argv)
@@ -400,7 +355,19 @@ int main(int argc, char **argv)
 	printf("[ppid: %d] ppn: %d, tpp: %d\n", ppid, ppn, tpp);
 
 	{
+		int error;
 		long size;
+		int n = 0;
+		char *shared_cpu_map;
+		cpu_set_t cpu_set;
+
+		if ((error = file_readable(
+			"/sys/devices/system/cpu/cpu%d/cache/index0/coherency_line_size",
+			0)) < 0) {
+			fprintf(stderr, "hee? %d\n", error);
+			exit(EXIT_FAILURE);
+		}
+
 		if (read_long(&size,
 			"/sys/devices/system/cpu/cpu%d/cache/index0/coherency_line_size",
 			0) < 0) {
@@ -408,6 +375,26 @@ int main(int argc, char **argv)
 		}
 
 		printf("coherency_line_size: %lu\n", size);
+		
+		if (read_string(&shared_cpu_map,
+			"/sys/devices/system/cpu/cpu%d/cache/index1/shared_cpu_map",
+			0) < 0) {
+			exit(EXIT_FAILURE);
+		}
+		
+		printf("shared_cpu_map: %s\n", shared_cpu_map);
+
+		if (read_bitmap(&cpu_set, 256,
+			"/sys/devices/system/cpu/cpu%d/cache/index1/shared_cpu_map",
+			0) < 0) {
+			exit(EXIT_FAILURE);
+		}
+
+		for (n = 0; n < 32; ++n) {
+			if (CPU_ISSET(n, &cpu_set)) {
+				printf("%s: CPU %d is set\n", __FUNCTION__, n);
+			}
+		}
 	}
 
 
