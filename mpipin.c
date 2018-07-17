@@ -45,7 +45,7 @@
 #include <bitmap.h>
 #include <list.h>
 
-#define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
 #define dprintf(FORMAT, ...) printf("[%d] "FORMAT, getpid(), ##__VA_ARGS__)
@@ -1323,6 +1323,8 @@ int main(int argc, char **argv)
 		error = EXIT_FAILURE;
 		goto cleanup_shm;
 	}
+
+	shm_unlink(shm_path);
 
 	if (execvp(argv[optind], &argv[optind]) < 0) {
 		fprintf(stderr, "error: executing %s\n", argv[optind]);
