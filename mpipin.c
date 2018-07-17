@@ -53,6 +53,45 @@
 #define dprintf(...)
 #endif
 
+
+/**
+ * cpuset_first - get the first cpu in a cpuset
+ * @srcp: the cpuset pointer
+ *
+ * Returns >= nr_cpu_ids if no cpus set.
+ */
+static inline unsigned int cpuset_first(const cpu_set_t *srcp)
+{
+	return find_first_bit((const long unsigned int*)
+			srcp, sizeof(cpu_set_t) * BITS_PER_BYTE);
+}
+
+/**
+ * cpuset_next - get the next cpu in a cpuset
+ * @n: the cpu prior to the place to search (ie. return will be > @n)
+ * @srcp: the cpuset pointer
+ *
+ * Returns >= nr_cpu_ids if no further cpus set.
+ */
+static inline unsigned int cpuset_next(int n, const cpu_set_t *srcp)
+{
+	return find_next_bit((const long unsigned int*)srcp,
+			sizeof(cpu_set_t) * BITS_PER_BYTE, n+1);
+}
+
+/**
+ * for_each_cpu - iterate over every cpu in a set
+ * @cpu: the (optionally unsigned) integer iterator
+ * @set: the cpuset pointer
+ *
+ * After the loop, cpu is >= nr_cpu_ids.
+ */
+#define for_each_cpu(cpu, set)				\
+	for ((cpu) = -1;				\
+		(cpu) = cpuset_next((cpu), (set)),	\
+		(cpu) < get_nprocs_conf();)
+
+
 int compact = 1;
 struct option options[] = {
 	{
@@ -128,7 +167,8 @@ struct cache_topology {
 
 struct cpu_topology {
 	struct list_head list;
-	int cpu_number;
+	int cpu_id;
+	int node_id;
 	int hw_id;
 	long physical_package_id;
 	long core_id;
@@ -402,7 +442,7 @@ static int collect_cache_topology(struct cpu_topology *cpu_topo, int index)
 
 	n = snprintf(prefix, PATH_MAX,
 			"/sys/devices/system/cpu/cpu%d/cache/index%d",
-			cpu_topo->cpu_number, index);
+			cpu_topo->cpu_id, index);
 	if (n >= PATH_MAX) {
 		error = -ENAMETOOLONG;
 		fprintf(stderr, "%s: error: name too long\n", __FUNCTION__);
@@ -507,6 +547,7 @@ static int collect_cpu_topology(int cpu)
 	int n;
 	struct cpu_topology *p = NULL;
 	int index;
+	int node;
 
 	prefix = malloc(PATH_MAX);
 	if (!prefix) {
@@ -532,7 +573,7 @@ static int collect_cpu_topology(int cpu)
 	memset(p, 0, sizeof(*p));
 
 	INIT_LIST_HEAD(&p->cache_topology_list);
-	p->cpu_number = cpu;
+	p->cpu_id = cpu;
 
 	error = read_long(&p->core_id, "%s/topology/core_id", prefix);
 	if (error) {
@@ -563,6 +604,19 @@ static int collect_cpu_topology(int cpu)
 		error = -EINVAL;
 		fprintf(stderr, "%s: error: accessing sysfs\n", __FUNCTION__);
 		goto out;
+	}
+
+	for (node = 0; node < numa_num_configured_nodes(); ++node) {
+		char node_dname[PATH_MAX];
+		struct stat st;
+
+		sprintf(node_dname, "%s/node%d", prefix, node);
+		if (stat(node_dname, &st) < 0) {
+			continue;
+		}
+
+		p->node_id = node;
+		break;
 	}
 
 	for (index = 0; index < 10; ++index) {
@@ -673,6 +727,8 @@ struct part_exec {
 	int nr_processes_left;
 	int process_rank;
 	cpu_set_t cpus_used;
+	cpu_set_t cpus_available;
+	int cpus_to_assign;
 	int first_process_ind;
 	struct process_list_item processes[MAX_PROCESSES];
 };
@@ -681,9 +737,9 @@ int pin_process(struct part_exec *pe, int ppn)
 {
 	struct cpu_topology *cpu_top, *cpu_top_i;
 	struct cache_topology *cache_top;
-	int cpu, cpus_assigned, cpus_to_assign, cpu_prev;
+	int cpu, cpus_assigned, cpu_prev;
 	int ret = 0;
-	cpu_set_t *cpus_used = NULL;
+	cpu_set_t *cpus_available = NULL;
 	cpu_set_t *cpus_to_use = NULL;
 	int my_i, i, prev_i, next_i;
 
@@ -846,46 +902,34 @@ int pin_process(struct part_exec *pe, int ppn)
 	}
 
 	--pe->nr_processes_left;
-#if 0
 
-	cpus_to_assign = udp->cpu_info->n_cpus / ppn;
-	cpus_used = kmalloc(sizeof(cpumask_t), GFP_KERNEL);
-	cpus_to_use = kmalloc(sizeof(cpumask_t), GFP_KERNEL);
-	if (!cpus_used || !cpus_to_use) {
+	cpus_available = malloc(sizeof(*cpus_available));
+	cpus_to_use = malloc(sizeof(*cpus_to_use));
+	if (!cpus_available || !cpus_to_use) {
 		fprintf(stderr, "%s: error: allocating cpu masks\n", __FUNCTION__);
 		ret = -ENOMEM;
 		goto put_and_unlock_out;
 	}
-	memcpy(cpus_used, &pe->cpus_used, sizeof(cpumask_t));
-	memset(cpus_to_use, 0, sizeof(cpumask_t));
+	memcpy(cpus_available, &pe->cpus_available, sizeof(cpu_set_t));
+	memset(cpus_to_use, 0, sizeof(cpu_set_t));
 
 	/* Find the first unused CPU */
-	cpu = cpumask_next_zero(-1, cpus_used);
-	if (cpu >= udp->cpu_info->n_cpus) {
-		fprintf(stderr, "%s: error: no more CPUs available\n",
-				__FUNCTION__);
-		ret = -EINVAL;
-		goto put_and_unlock_out;
-	}
+	cpu = cpuset_first(cpus_available);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-	cpumask_set_cpu(cpu, cpus_used);
-	cpumask_set_cpu(cpu, cpus_to_use);
-#else
-	cpu_set(cpu, *cpus_used);
-	cpu_set(cpu, *cpus_to_use);
-#endif
+	CPU_CLR(cpu, cpus_available);
+	CPU_SET(cpu, cpus_to_use);
+
 	cpu_prev = cpu;
 	dprintf("%s: CPU %d assigned (first)\n", __FUNCTION__, cpu);
 
-	for (cpus_assigned = 1; cpus_assigned < cpus_to_assign;
+	for (cpus_assigned = 1; cpus_assigned < pe->cpus_to_assign;
 			++cpus_assigned) {
 		int node;
 
 		cpu_top = NULL;
 		/* Find the topology object of the last core assigned */
-		list_for_each_entry(cpu_top_i, &udp->cpu_topology_list, chain) {
-			if (cpu_top_i->mckernel_cpu_id == cpu_prev) {
+		list_for_each_entry(cpu_top_i, &cpu_topology_list, list) {
+			if (cpu_top_i->cpu_id == cpu_prev) {
 				cpu_top = cpu_top_i;
 				break;
 			}
@@ -898,49 +942,47 @@ int pin_process(struct part_exec *pe, int ppn)
 			goto put_and_unlock_out;
 		}
 
+		node = cpu_top->node_id;
+
 		/* Find a core sharing the same cache iterating caches from
 		 * the most inner one outwards */
-		list_for_each_entry(cache_top, &cpu_top->cache_list, chain) {
+		list_for_each_entry(cache_top, &cpu_top->cache_topology_list, list) {
 			for_each_cpu(cpu, &cache_top->shared_cpu_map) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-				if (!cpumask_test_cpu(cpu, cpus_used)) {
-#else
-				if (!cpu_isset(cpu, *cpus_used)) {
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-					cpumask_set_cpu(cpu, cpus_used);
-					cpumask_set_cpu(cpu, cpus_to_use);
-#else
-					cpu_set(cpu, *cpus_used);
-					cpu_set(cpu, *cpus_to_use);
-#endif
+				if (CPU_ISSET(cpu, cpus_available)) {
+					CPU_CLR(cpu, cpus_available);
+					CPU_SET(cpu, cpus_to_use);
+
 					cpu_prev = cpu;
 					dprintf("%s: CPU %d assigned (same cache L%lu)\n",
-						__FUNCTION__, cpu, cache_top->saved->level);
+						__FUNCTION__, cpu, cache_top->level);
 					goto next_cpu;
 				}
 			}
 		}
 
-		/* No CPU? Find a core from the same NUMA node */
-		node = linux_numa_2_mckernel_numa(udp,
-				cpu_to_node(mckernel_cpu_2_linux_cpu(udp, cpu_prev)));
+		/* Find a CPU from the same NUMA node */
+		for_each_cpu(cpu, cpus_available) {
+			cpu_top = NULL;
+			/* Find the topology object of this CPU */
+			list_for_each_entry(cpu_top_i, &cpu_topology_list, list) {
+				if (cpu_top_i->cpu_id == cpu) {
+					cpu_top = cpu_top_i;
+					break;
+				}
+			}
 
-		for_each_cpu_not(cpu, cpus_used) {
-			/* Invalid CPU? */
-			if (cpu >= udp->cpu_info->n_cpus)
-				break;
+			if (!cpu_top) {
+				fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
+						__FUNCTION__);
+				ret = -EINVAL;
+				goto put_and_unlock_out;
+			}
 
 			/* Found one */
-			if (node == linux_numa_2_mckernel_numa(udp,
-						cpu_to_node(mckernel_cpu_2_linux_cpu(udp, cpu)))) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-				cpumask_set_cpu(cpu, cpus_used);
-				cpumask_set_cpu(cpu, cpus_to_use);
-#else
-				cpu_set(cpu, *cpus_used);
-				cpu_set(cpu, *cpus_to_use);
-#endif
+			if (node == cpu_top->node_id) {
+				CPU_CLR(cpu, cpus_available);
+				CPU_SET(cpu, cpus_to_use);
+
 				cpu_prev = cpu;
 				dprintf("%s: CPU %d assigned (same NUMA)\n",
 						__FUNCTION__, cpu);
@@ -949,40 +991,27 @@ int pin_process(struct part_exec *pe, int ppn)
 		}
 
 		/* No CPU? Simply find the next unused one */
-		cpu = cpumask_next_zero(-1, cpus_used);
-		if (cpu >= udp->cpu_info->n_cpus) {
-			fprintf(stderr, "%s: error: no more CPUs available\n",
-					__FUNCTION__);
-			ret = -EINVAL;
-			goto put_and_unlock_out;
-		}
+		cpu = cpuset_first(cpus_available);
+		CPU_CLR(cpu, cpus_available);
+		CPU_SET(cpu, cpus_to_use);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-		cpumask_set_cpu(cpu, cpus_used);
-		cpumask_set_cpu(cpu, cpus_to_use);
-#else
-		cpu_set(cpu, *cpus_used);
-		cpu_set(cpu, *cpus_to_use);
-#endif
 		cpu_prev = cpu;
 		dprintf("%s: CPU %d assigned (unused)\n",
 				__FUNCTION__, cpu);
-
 next_cpu:
 		continue;
 	}
 
-	/* Commit used cores to shared memory */
-	memcpy(&pe->cpus_used, cpus_used, sizeof(*cpus_used));
+	/* Commit unused cores to shared memory */
+	memcpy(&pe->cpus_available, cpus_available, sizeof(*cpus_available));
 
-#endif
 	/* Reset if last process */
 	if (pe->nr_processes_left == 0) {
 		dprintf("%s: nr_processes: %d (partitioned exec ends)\n",
 				__FUNCTION__,
 				pe->nr_processes);
 		pe->nr_processes = -1;
-		memset(&pe->cpus_used, 0, sizeof(pe->cpus_used));
+		memset(&pe->cpus_available, 0, sizeof(pe->cpus_available));
 	}
 	/* Otherwise wake up next process in list */
 	else {
@@ -1002,7 +1031,7 @@ next_cpu:
 
 put_and_unlock_out:
 	//free(cpus_to_use);
-	//free(cpus_used);
+	//free(cpus_available);
 	pthread_mutex_unlock(&pe->lock);
 
 	return ret;
@@ -1029,6 +1058,7 @@ int main(int argc, char **argv)
 	struct stat st;
 	size_t shm_size;
 	struct part_exec *pe;
+	cpu_set_t cpus_available;
 
 	/* Parse options */
 	while ((opt = getopt_long(argc, argv, "n:p:t:", options, NULL)) != -1) {
@@ -1165,7 +1195,7 @@ int main(int argc, char **argv)
 				}
 
 				list_for_each_entry(cpu_topo_iter, &cpu_topology_list, list) {
-					if (cpu_topo_iter->cpu_number == cpu) {
+					if (cpu_topo_iter->cpu_id == cpu) {
 						cpu_topo = cpu_topo_iter;
 						break;
 					}
@@ -1219,7 +1249,7 @@ int main(int argc, char **argv)
 	if (fstat(shm_fd, &st) < 0) {
 		fprintf(stderr, "error: stating shm file\n");
 		error = EXIT_FAILURE;
-		goto cleanup_shm;
+		goto unlock_cleanup_shm;
 	}
 
 	dprintf("st_size: %lu\n", st.st_size);
@@ -1233,7 +1263,7 @@ int main(int argc, char **argv)
 	if (shm == MAP_FAILED) {
 		fprintf(stderr, "error: mapping shared memory file\n");
 		error = EXIT_FAILURE;
-		goto cleanup_shm;
+		goto unlock_cleanup_shm;
 	}
 
 	pe = (struct part_exec *)shm;
@@ -1263,10 +1293,34 @@ int main(int argc, char **argv)
 		pe->nr_processes = -1;
 		pe->nr_processes_left = -1;
 		pe->first_process_ind = -1;
+
+		if (sched_getaffinity(0, sizeof(cpu_set_t),
+					&pe->cpus_available) == -1) {
+			fprintf(stderr, "error: obtaining CPU affinity\n");
+			error = EXIT_FAILURE;
+			goto unlock_cleanup_shm;
+		}
+
+		pe->cpus_to_assign = CPU_COUNT(&pe->cpus_available) / ppn;
+		dprintf("%s: CPUs to assign: %d\n",
+				__FUNCTION__, pe->cpus_to_assign);
 	}
 
 	if (flock(shm_fd, LOCK_UN) < 0) {
 		fprintf(stderr, "error: unlocking shared memory folder\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
+
+	/* Check if we are pinned already */
+	if (sched_getaffinity(0, sizeof(cpu_set_t), &cpus_available) == -1) {
+		fprintf(stderr, "error: obtaining CPU affinity\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
+
+	if (memcmp(&cpus_available, &pe->cpus_available, sizeof(cpu_set_t))) {
+		fprintf(stderr, "error: CPU affinity already set (differs)\n");
 		error = EXIT_FAILURE;
 		goto cleanup_shm;
 	}
@@ -1281,4 +1335,14 @@ cleanup_shm:
 	shm_unlink(shm_path);
 
 	return error;
+
+unlock_cleanup_shm:
+	if (flock(shm_fd, LOCK_UN) < 0) {
+		fprintf(stderr, "error: unlocking shared memory folder\n");
+		error = EXIT_FAILURE;
+	}
+
+	goto cleanup_shm;
 }
+
+
