@@ -759,7 +759,7 @@ int pin_process(struct part_exec *pe, int ppn)
 				" doesn't match current partitioned execution\n",
 				__FUNCTION__);
 		ret = -EINVAL;
-		goto put_and_unlock_out;
+		goto unlock_out;
 	}
 
 	--pe->nr_processes_left;
@@ -878,7 +878,7 @@ int pin_process(struct part_exec *pe, int ppn)
 
 			fprintf(stderr, "%s: error: pid: %d, woken everyone, out\n",
 					__FUNCTION__, getpid());
-			goto put_and_unlock_out;
+			goto unlock_out;
 		}
 
 		/* Interrupted or woken up by someone else due to timeout? */
@@ -886,7 +886,7 @@ int pin_process(struct part_exec *pe, int ppn)
 			fprintf(stderr, "%s: error: pid: %d, job startup timed out\n",
 					__FUNCTION__, getpid());
 			ret = -ETIMEDOUT;
-			goto put_and_unlock_out;
+			goto unlock_out;
 		}
 
 		/* Incorrect wakeup state? */
@@ -894,7 +894,7 @@ int pin_process(struct part_exec *pe, int ppn)
 			fprintf(stderr, "%s: error: pid: %d, not ready but woken?\n",
 					__FUNCTION__, getpid());
 			ret = -EINVAL;
-			goto put_and_unlock_out;
+			goto unlock_out;
 		}
 
 		dprintf("%s: pid: %d, woken up\n",
@@ -908,7 +908,7 @@ int pin_process(struct part_exec *pe, int ppn)
 	if (!cpus_available || !cpus_to_use) {
 		fprintf(stderr, "%s: error: allocating cpu masks\n", __FUNCTION__);
 		ret = -ENOMEM;
-		goto put_and_unlock_out;
+		goto unlock_out;
 	}
 	memcpy(cpus_available, &pe->cpus_available, sizeof(cpu_set_t));
 	memset(cpus_to_use, 0, sizeof(cpu_set_t));
@@ -939,7 +939,7 @@ int pin_process(struct part_exec *pe, int ppn)
 			fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
 					__FUNCTION__);
 			ret = -EINVAL;
-			goto put_and_unlock_out;
+			goto unlock_out;
 		}
 
 		node = cpu_top->node_id;
@@ -975,7 +975,7 @@ int pin_process(struct part_exec *pe, int ppn)
 				fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
 						__FUNCTION__);
 				ret = -EINVAL;
-				goto put_and_unlock_out;
+				goto unlock_out;
 			}
 
 			/* Found one */
@@ -1031,13 +1031,13 @@ next_cpu:
 		fprintf(stderr, "%s: error: setting CPU affinity\n",
 				__FUNCTION__);
 		ret = -EINVAL;
-		goto put_and_unlock_out;
+		goto unlock_out;
 
 	}
 
 	ret = 0;
 
-put_and_unlock_out:
+unlock_out:
 	free(cpus_to_use);
 	free(cpus_available);
 	pthread_mutex_unlock(&pe->lock);
