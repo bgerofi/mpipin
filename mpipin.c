@@ -1334,18 +1334,22 @@ int main(int argc, char **argv)
 	}
 
 	/* We have the region, now wait for all processes and do the pin */
-	pin_process(pe, ppn);
-
-
-	error = 0;
-
-cleanup_shm:
-	shm_unlink(shm_path);
+	if (pin_process(pe, ppn) < 0) {
+		fprintf(stderr, "error: pinning\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
 
 	if (execvp(argv[optind], &argv[optind]) < 0) {
 		fprintf(stderr, "error: executing %s\n", argv[optind]);
 		error = EXIT_FAILURE;
 	}
+
+	/* Shouldn't reach here.. */
+	error = 0;
+
+cleanup_shm:
+	shm_unlink(shm_path);
 
 	return error;
 
