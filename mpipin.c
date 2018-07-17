@@ -136,6 +136,12 @@ struct option options[] = {
 		.flag =		NULL,
 		.val =		'p',
 	},
+	{
+		.name =		"exclude-cpus",
+		.has_arg =	required_argument,
+		.flag =		NULL,
+		.val =		'e',
+	},
 	/* end */
 	{ NULL, 0, NULL, 0, },
 };
@@ -1057,19 +1063,23 @@ int main(int argc, char **argv)
 	int error;
 	int ppn = 0;
 	int tpp = 0;
-	pid_t ppid;
 	int opt;
-	char shm_path[PATH_MAX];
 	int shm_fd;
-	void *shm;
 	int shm_created = 0;
+	int cpu;
+	pid_t ppid;
+	void *shm;
 	struct stat st;
 	size_t shm_size;
 	struct part_exec *pe;
 	cpu_set_t cpus_available;
+	cpu_set_t cpus_excluded;
+	char shm_path[PATH_MAX];
+
+	memset(&cpus_excluded, 0, sizeof(cpu_set_t));
 
 	/* Parse options */
-	while ((opt = getopt_long(argc, argv, "+n:p:t:", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "+n:p:t:e:", options, NULL)) != -1) {
 		char *tmp;
 
 		switch (opt) {
@@ -1086,6 +1096,15 @@ int main(int argc, char **argv)
 				tpp = strtol(optarg, &tmp, 0);
 				if (*tmp != '\0' || tpp <= 0) {
 					fprintf(stderr, "error: -t: invalid number of threads\n");
+					exit(EXIT_FAILURE);
+				}
+				break;
+
+			case 'e':
+				error = bitmap_parselist(optarg, (unsigned long int*)&cpus_excluded,
+						sizeof(cpu_set_t) * BITS_PER_BYTE);
+				if (error) {
+					fprintf(stderr, "error: parsing excluded CPU list\n");
 					exit(EXIT_FAILURE);
 				}
 				break;
@@ -1124,63 +1143,19 @@ int main(int argc, char **argv)
 
 	dprintf("[ppid: %d] ppn: %d, tpp: %d\n", ppid, ppn, tpp);
 
-#if 0
-	{
-		int error;
-		long size;
-		int n = 0;
-		char *shared_cpu_map;
-		cpu_set_t cpu_set;
-
-		if ((error = file_readable(
-			"/sys/devices/system/cpu/cpu%d/cache/index0/coherency_line_size",
-			0)) < 0) {
-			fprintf(stderr, "hee? %d\n", error);
-			exit(EXIT_FAILURE);
-		}
-
-		if (read_long(&size,
-			"/sys/devices/system/cpu/cpu%d/cache/index0/coherency_line_size",
-			0) < 0) {
-			exit(EXIT_FAILURE);
-		}
-
-		printf("coherency_line_size: %lu\n", size);
-		
-		if (read_string(&shared_cpu_map,
-			"/sys/devices/system/cpu/cpu%d/cache/index1/shared_cpu_map",
-			0) < 0) {
-			exit(EXIT_FAILURE);
-		}
-		
-		printf("shared_cpu_map: %s\n", shared_cpu_map);
-
-		if (read_bitmap(&cpu_set, get_nprocs_conf(),
-			"/sys/devices/system/cpu/cpu%d/cache/index1/shared_cpu_map",
-			0) < 0) {
-			exit(EXIT_FAILURE);
-		}
-
-		for (n = 0; n < get_nprocs_conf(); ++n) {
-			if (CPU_ISSET(n, &cpu_set)) {
-				printf("%s: CPU %d is set\n", __FUNCTION__, n);
-			}
-		}
-
-		if (read_bitmap_parselist(&cpu_set, get_nprocs_conf(),
-			"/sys/devices/system/cpu/online",
-			0) < 0) {
-			exit(EXIT_FAILURE);
-		}
-
-		for (n = 0; n < get_nprocs_conf(); ++n) {
-			if (CPU_ISSET(n, &cpu_set)) {
-				printf("%s: CPU %d is online\n", __FUNCTION__, n);
-			}
-		}
+	/* Get affinity */
+	if (sched_getaffinity(0, sizeof(cpu_set_t), &cpus_available) == -1) {
+		fprintf(stderr, "error: obtaining CPU affinity\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
 	}
-#endif
 
+	/* Exclude excluded CPUs.. */
+	for_each_cpu(cpu, &cpus_excluded) {
+		CPU_CLR(cpu, &cpus_available);
+	}
+
+	/* Collect topology information */
 	if (collect_topology() < 0) {
 		exit(EXIT_FAILURE);
 	}
@@ -1281,7 +1256,6 @@ int main(int argc, char **argv)
 	/* First process initializes shared memory variables */
 	if (shm_created) {
 		int pi;
-
 		memset(shm, 0, shm_size);
 
 		/* Cross-process mutex */
@@ -1302,13 +1276,7 @@ int main(int argc, char **argv)
 		pe->nr_processes_left = -1;
 		pe->first_process_ind = -1;
 
-		if (sched_getaffinity(0, sizeof(cpu_set_t),
-					&pe->cpus_available) == -1) {
-			fprintf(stderr, "error: obtaining CPU affinity\n");
-			error = EXIT_FAILURE;
-			goto unlock_cleanup_shm;
-		}
-
+		memcpy(&pe->cpus_available, &cpus_available, sizeof(cpu_set_t));
 		pe->cpus_to_assign = CPU_COUNT(&pe->cpus_available) / ppn;
 		dprintf("%s: CPUs to assign: %d\n",
 				__FUNCTION__, pe->cpus_to_assign);
@@ -1321,12 +1289,6 @@ int main(int argc, char **argv)
 	}
 
 	/* Check if we are pinned already */
-	if (sched_getaffinity(0, sizeof(cpu_set_t), &cpus_available) == -1) {
-		fprintf(stderr, "error: obtaining CPU affinity\n");
-		error = EXIT_FAILURE;
-		goto cleanup_shm;
-	}
-
 	if (memcmp(&cpus_available, &pe->cpus_available, sizeof(cpu_set_t))) {
 		fprintf(stderr, "error: CPU affinity already set (differs)\n");
 		error = EXIT_FAILURE;
