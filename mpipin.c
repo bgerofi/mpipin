@@ -659,9 +659,6 @@ struct process_list_item {
 	int pid;
 	unsigned long start_ts;
 
-	pthread_mutexattr_t wait_lock_attr;
-	pthread_mutex_t wait_lock;
-
 	pthread_condattr_t wait_cv_attr;
 	pthread_cond_t wait_cv;
 	int next_process_ind;
@@ -811,7 +808,7 @@ int pin_process(struct part_exec *pe, int ppn)
 					pe->processes[pe->first_process_ind].next_process_ind;
 				if (pli_next->pid == getpid())
 					continue;
-				dprintf("%s: pid: %d, waking next proc: %d\n",
+				dprintf("%s: waking next proc: %d\n",
 						__FUNCTION__, pli_next->pid);
 
 				pli_next->ready = 1;
@@ -1255,13 +1252,6 @@ int main(int argc, char **argv)
 		pthread_mutex_init(&pe->lock, &pe->lock_attr);
 
 		for (pi = 0; pi < MAX_PROCESSES; ++pi) {
-			/*
-			pthread_mutexattr_init(&pe->processes[pi].wait_lock_attr);
-			pthread_mutexattr_setpshared(&pe->processes[pi].wait_lock_attr,
-					PTHREAD_PROCESS_SHARED);
-			pthread_mutex_init(&pe->processes[pi].wait_lock,
-					&pe->processes[pi].wait_lock_attr);
-			*/
 			pthread_condattr_init(&pe->processes[pi].wait_cv_attr);
 			pthread_condattr_setpshared(&pe->processes[pi].wait_cv_attr,
 					PTHREAD_PROCESS_SHARED);
