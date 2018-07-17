@@ -737,6 +737,7 @@ struct part_exec {
 	int cpus_to_assign;
 	int first_process_ind;
 	struct process_list_item processes[MAX_PROCESSES];
+	cpu_set_t affinities[MAX_PROCESSES];
 };
 
 int pin_process(struct part_exec *pe, int ppn)
@@ -860,6 +861,7 @@ int pin_process(struct part_exec *pe, int ppn)
 		/* First timeout task? Wake up everyone else,
 		 * but tell them we timed out */
 		if (ret == ETIMEDOUT) {
+abort_all:
 			fprintf(stderr, "%s: error: pid: %d, timed out, waking everyone\n",
 					__FUNCTION__, getpid());
 			while (pe->first_process_ind != -1) {
@@ -909,107 +911,133 @@ int pin_process(struct part_exec *pe, int ppn)
 
 	--pe->nr_processes_left;
 
-	cpus_available = malloc(sizeof(*cpus_available));
-	cpus_to_use = malloc(sizeof(*cpus_to_use));
-	if (!cpus_available || !cpus_to_use) {
-		fprintf(stderr, "%s: error: allocating cpu masks\n", __FUNCTION__);
-		ret = -ENOMEM;
-		goto unlock_out;
-	}
-	memcpy(cpus_available, &pe->cpus_available, sizeof(cpu_set_t));
-	memset(cpus_to_use, 0, sizeof(cpu_set_t));
-
-	/* Find the first unused CPU */
-	cpu = cpuset_first(cpus_available);
-
-	CPU_CLR(cpu, cpus_available);
-	CPU_SET(cpu, cpus_to_use);
-
-	cpu_prev = cpu;
-	dprintf("%s: CPU %d assigned (first)\n", __FUNCTION__, cpu);
-
-	for (cpus_assigned = 1; cpus_assigned < pe->cpus_to_assign;
-			++cpus_assigned) {
-		int node;
-
-		cpu_top = NULL;
-		/* Find the topology object of the last core assigned */
-		list_for_each_entry(cpu_top_i, &cpu_topology_list, list) {
-			if (cpu_top_i->cpu_id == cpu_prev) {
-				cpu_top = cpu_top_i;
-				break;
-			}
+	/* First process does the partitioning */
+	if (pe->process_rank == 0) {
+		/* Collect topology information */
+		if (collect_topology() < 0) {
+			fprintf(stderr, "%s: error: collecting topology information\n",
+					__FUNCTION__);
+			/* Ugly.. */
+			ret = ETIMEDOUT;
+			goto abort_all;
 		}
 
-		if (!cpu_top) {
-			fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
-					__FUNCTION__);
-			ret = -EINVAL;
+		dprintf("%s: topology information collected\n", __FUNCTION__);
+
+		cpus_available = malloc(sizeof(*cpus_available));
+		cpus_to_use = malloc(sizeof(*cpus_to_use));
+		if (!cpus_available || !cpus_to_use) {
+			fprintf(stderr, "%s: error: allocating cpu masks\n", __FUNCTION__);
+			ret = -ENOMEM;
 			goto unlock_out;
 		}
 
-		node = cpu_top->node_id;
+		for (pe->process_rank = 0;
+				pe->process_rank < pe->nr_processes;
+				++pe->process_rank) {
 
-		/* Find a core sharing the same cache iterating caches from
-		 * the most inner one outwards */
-		list_for_each_entry(cache_top, &cpu_top->cache_topology_list, list) {
-			for_each_cpu(cpu, &cache_top->shared_cpu_map) {
-				if (CPU_ISSET(cpu, cpus_available)) {
-					CPU_CLR(cpu, cpus_available);
-					CPU_SET(cpu, cpus_to_use);
+			memcpy(cpus_available, &pe->cpus_available, sizeof(cpu_set_t));
+			memset(cpus_to_use, 0, sizeof(cpu_set_t));
 
-					cpu_prev = cpu;
-					dprintf("%s: CPU %d assigned (same cache L%lu)\n",
-						__FUNCTION__, cpu, cache_top->level);
-					goto next_cpu;
+			/* Find the first unused CPU */
+			cpu = cpuset_first(cpus_available);
+
+			CPU_CLR(cpu, cpus_available);
+			CPU_SET(cpu, cpus_to_use);
+
+			cpu_prev = cpu;
+			dprintf("%s: CPU %d assigned (first)\n", __FUNCTION__, cpu);
+
+			for (cpus_assigned = 1; cpus_assigned < pe->cpus_to_assign;
+					++cpus_assigned) {
+				int node;
+
+				cpu_top = NULL;
+				/* Find the topology object of the last core assigned */
+				list_for_each_entry(cpu_top_i, &cpu_topology_list, list) {
+					if (cpu_top_i->cpu_id == cpu_prev) {
+						cpu_top = cpu_top_i;
+						break;
+					}
 				}
-			}
-		}
 
-		/* Find a CPU from the same NUMA node */
-		for_each_cpu(cpu, cpus_available) {
-			cpu_top = NULL;
-			/* Find the topology object of this CPU */
-			list_for_each_entry(cpu_top_i, &cpu_topology_list, list) {
-				if (cpu_top_i->cpu_id == cpu) {
-					cpu_top = cpu_top_i;
-					break;
+				if (!cpu_top) {
+					fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
+							__FUNCTION__);
+					ret = -EINVAL;
+					goto unlock_out;
 				}
-			}
 
-			if (!cpu_top) {
-				fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
-						__FUNCTION__);
-				ret = -EINVAL;
-				goto unlock_out;
-			}
+				node = cpu_top->node_id;
 
-			/* Found one */
-			if (node == cpu_top->node_id) {
+				/* Find a core sharing the same cache iterating caches from
+				 * the most inner one outwards */
+				list_for_each_entry(cache_top, &cpu_top->cache_topology_list, list) {
+					for_each_cpu(cpu, &cache_top->shared_cpu_map) {
+						if (CPU_ISSET(cpu, cpus_available)) {
+							CPU_CLR(cpu, cpus_available);
+							CPU_SET(cpu, cpus_to_use);
+
+							cpu_prev = cpu;
+							dprintf("%s: CPU %d assigned (same cache L%lu)\n",
+									__FUNCTION__, cpu, cache_top->level);
+							goto next_cpu;
+						}
+					}
+				}
+
+				/* Find a CPU from the same NUMA node */
+				for_each_cpu(cpu, cpus_available) {
+					cpu_top = NULL;
+					/* Find the topology object of this CPU */
+					list_for_each_entry(cpu_top_i, &cpu_topology_list, list) {
+						if (cpu_top_i->cpu_id == cpu) {
+							cpu_top = cpu_top_i;
+							break;
+						}
+					}
+
+					if (!cpu_top) {
+						fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
+								__FUNCTION__);
+						ret = -EINVAL;
+						goto unlock_out;
+					}
+
+					/* Found one */
+					if (node == cpu_top->node_id) {
+						CPU_CLR(cpu, cpus_available);
+						CPU_SET(cpu, cpus_to_use);
+
+						cpu_prev = cpu;
+						dprintf("%s: CPU %d assigned (same NUMA)\n",
+								__FUNCTION__, cpu);
+						goto next_cpu;
+					}
+				}
+
+				/* No CPU? Simply find the next unused one */
+				cpu = cpuset_first(cpus_available);
 				CPU_CLR(cpu, cpus_available);
 				CPU_SET(cpu, cpus_to_use);
 
 				cpu_prev = cpu;
-				dprintf("%s: CPU %d assigned (same NUMA)\n",
+				dprintf("%s: CPU %d assigned (unused)\n",
 						__FUNCTION__, cpu);
-				goto next_cpu;
+next_cpu:
+				continue;
 			}
+
+			/* Commit unused cores to shared memory */
+			memcpy(&pe->cpus_available, cpus_available, sizeof(*cpus_available));
+			memcpy(&pe->affinities[pe->process_rank],
+				cpus_to_use, sizeof(cpu_set_t));
 		}
 
-		/* No CPU? Simply find the next unused one */
-		cpu = cpuset_first(cpus_available);
-		CPU_CLR(cpu, cpus_available);
-		CPU_SET(cpu, cpus_to_use);
-
-		cpu_prev = cpu;
-		dprintf("%s: CPU %d assigned (unused)\n",
-				__FUNCTION__, cpu);
-next_cpu:
-		continue;
+		pe->process_rank = 0;
+		free(cpus_to_use);
+		free(cpus_available);
 	}
-
-	/* Commit unused cores to shared memory */
-	memcpy(&pe->cpus_available, cpus_available, sizeof(*cpus_available));
 
 	/* Reset if last process */
 	if (pe->nr_processes_left == 0) {
@@ -1029,11 +1057,11 @@ next_cpu:
 				__FUNCTION__, pe->processes[next_i].pid);
 		pthread_cond_signal(&pe->processes[next_i].wait_cv);
 	}
+
 	dprintf("%s: rank: %d, ret: 0\n",
 			__FUNCTION__, pe->process_rank);
-	++pe->process_rank;
-
-	if (sched_setaffinity(0, sizeof(cpu_set_t), cpus_to_use) < 0) {
+	if (sched_setaffinity(0, sizeof(cpu_set_t),
+				&pe->affinities[pe->process_rank]) < 0) {
 		fprintf(stderr, "%s: error: setting CPU affinity\n",
 				__FUNCTION__);
 		ret = -EINVAL;
@@ -1041,11 +1069,11 @@ next_cpu:
 
 	}
 
+	++pe->process_rank;
+
 	ret = 0;
 
 unlock_out:
-	free(cpus_to_use);
-	free(cpus_available);
 	pthread_mutex_unlock(&pe->lock);
 
 	return ret;
@@ -1155,12 +1183,6 @@ int main(int argc, char **argv)
 		CPU_CLR(cpu, &cpus_available);
 	}
 
-	/* Collect topology information */
-	if (collect_topology() < 0) {
-		exit(EXIT_FAILURE);
-	}
-
-	dprintf("Topology information collected OK\n");
 #if 0
 	{
 		struct node_topology *node_topo;
