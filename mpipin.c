@@ -1027,11 +1027,19 @@ next_cpu:
 			__FUNCTION__, pe->process_rank);
 	++pe->process_rank;
 
+	if (sched_setaffinity(0, sizeof(cpu_set_t), cpus_to_use) < 0) {
+		fprintf(stderr, "%s: error: setting CPU affinity\n",
+				__FUNCTION__);
+		ret = -EINVAL;
+		goto put_and_unlock_out;
+
+	}
+
 	ret = 0;
 
 put_and_unlock_out:
-	//free(cpus_to_use);
-	//free(cpus_available);
+	free(cpus_to_use);
+	free(cpus_available);
 	pthread_mutex_unlock(&pe->lock);
 
 	return ret;
@@ -1061,7 +1069,7 @@ int main(int argc, char **argv)
 	cpu_set_t cpus_available;
 
 	/* Parse options */
-	while ((opt = getopt_long(argc, argv, "n:p:t:", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "+n:p:t:", options, NULL)) != -1) {
 		char *tmp;
 
 		switch (opt) {
@@ -1333,6 +1341,11 @@ int main(int argc, char **argv)
 
 cleanup_shm:
 	shm_unlink(shm_path);
+
+	if (execvp(argv[optind], &argv[optind]) < 0) {
+		fprintf(stderr, "error: executing %s\n", argv[optind]);
+		error = EXIT_FAILURE;
+	}
 
 	return error;
 
