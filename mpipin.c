@@ -852,7 +852,7 @@ int pin_process(struct part_exec *pe, int ppn)
 				__FUNCTION__, getpid());
 		/* Timeout period: 10 secs + (#procs * 0.1sec) */
 		clock_gettime(CLOCK_REALTIME, &ts);
-		ts.tv_sec += (5 + pe->nr_processes / 10);
+		ts.tv_sec += (10 + pe->nr_processes / 10);
 
 		ret = pthread_cond_timedwait(&pli->wait_cv,
 				&pe->lock, &ts);
