@@ -32,6 +32,9 @@
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/ptrace.h>
+#include <sys/file.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -41,6 +44,14 @@
 
 #include <bitmap.h>
 #include <list.h>
+
+#define DEBUG
+
+#ifdef DEBUG
+#define dprintf(FORMAT, ...) printf("[%d] "FORMAT, getpid(), ##__VA_ARGS__)
+#else
+#define dprintf(...)
+#endif
 
 int compact = 1;
 struct option options[] = {
@@ -101,7 +112,7 @@ void print_usage(char **argv)
  */
 
 struct cache_topology {
-	struct list_head chain;
+	struct list_head list;
 	int index;
 	int padding;
 	long level;
@@ -116,7 +127,7 @@ struct cache_topology {
 };
 
 struct cpu_topology {
-	struct list_head chain;
+	struct list_head list;
 	int cpu_number;
 	int hw_id;
 	long physical_package_id;
@@ -127,7 +138,7 @@ struct cpu_topology {
 };
 
 struct node_topology {
-	struct list_head chain;
+	struct list_head list;
 	int node_number;
 	int padding;
 	cpu_set_t cpumap;
@@ -474,7 +485,7 @@ static int collect_cache_topology(struct cpu_topology *cpu_topo, int index)
 	}
 
 	error = 0;
-	list_add(&p->chain, &cpu_topo->cache_topology_list);
+	list_add_tail(&p->list, &cpu_topo->cache_topology_list);
 	p = NULL;
 
 out:
@@ -564,7 +575,7 @@ static int collect_cpu_topology(int cpu)
 	}
 
 	error = 0;
-	list_add(&p->chain, &cpu_topology_list);
+	list_add_tail(&p->list, &cpu_topology_list);
 	p = NULL;
 
 out:
@@ -597,7 +608,7 @@ static int collect_node_topology(int node)
 	}
 
 	error = 0;
-	list_add(&p->chain, &node_topology_list);
+	list_add_tail(&p->list, &node_topology_list);
 	p = NULL;
 
 out:
@@ -639,16 +650,388 @@ static int collect_topology(void)
 	return 0;
 }
 
+/*
+ * Partitioning information.
+ */
+struct process_list_item {
+	int ready;
+	int timeout;
+	int pid;
+	unsigned long start_ts;
+
+	pthread_mutexattr_t wait_lock_attr;
+	pthread_mutex_t wait_lock;
+
+	pthread_condattr_t wait_cv_attr;
+	pthread_cond_t wait_cv;
+	int next_process_ind;
+};
+
+#define MAX_PROCESSES 1024
+
+struct part_exec {
+	pthread_mutexattr_t lock_attr;
+	pthread_mutex_t lock;
+	int nr_processes;
+	int nr_processes_left;
+	int process_rank;
+	cpu_set_t cpus_used;
+	int first_process_ind;
+	struct process_list_item processes[MAX_PROCESSES];
+};
+
+int pin_process(struct part_exec *pe, int ppn)
+{
+	struct cpu_topology *cpu_top, *cpu_top_i;
+	struct cache_topology *cache_top;
+	int cpu, cpus_assigned, cpus_to_assign, cpu_prev;
+	int ret = 0;
+	cpu_set_t *cpus_used = NULL;
+	cpu_set_t *cpus_to_use = NULL;
+	int my_i, i, prev_i, next_i;
+
+	pthread_mutex_lock(&pe->lock);
+
+	/* First process to enter CPU partitioning */
+	if (pe->nr_processes == -1) {
+		pe->nr_processes = ppn;
+		pe->nr_processes_left = ppn;
+		dprintf("%s: nr_processes: %d (partitioned exec starts)\n",
+				__FUNCTION__,
+				pe->nr_processes);
+	}
+
+	if (pe->nr_processes != ppn) {
+		fprintf(stderr, "%s: error: requested number of processes"
+				" doesn't match current partitioned execution\n",
+				__FUNCTION__);
+		ret = -EINVAL;
+		goto put_and_unlock_out;
+	}
+
+	--pe->nr_processes_left;
+	dprintf("%s: nr_processes: %d, nr_processes_left: %d\n",
+			__FUNCTION__,
+			pe->nr_processes,
+			pe->nr_processes_left);
+
+	/* Find empty process slot */
+	my_i = -1;
+	for (i = 0; i < MAX_PROCESSES; ++i) {
+		if (pe->processes[i].pid == 0) {
+			my_i = i;
+			break;
+		}
+	}
+
+	pe->processes[my_i].pid = getpid();
+	pe->processes[my_i].ready = 0;
+	pe->processes[my_i].timeout = 0;
+	pe->processes[my_i].next_process_ind = -1;
+
+	/*
+	 * Add ourself to the list in order of PID
+	 * TODO: add start time
+	 */
+	if (pe->first_process_ind == -1) {
+		pe->first_process_ind = my_i;
+		dprintf("%s: add to empty list as first\n",
+				__FUNCTION__);
+	}
+	else {
+		prev_i = -1;
+		for (i = pe->first_process_ind; i != -1;
+				i = pe->processes[i].next_process_ind) {
+
+			if (pe->processes[i].pid > getpid()) {
+				break;
+			}
+
+			prev_i = i;
+		}
+
+		/* First element */
+		if (prev_i == -1) {
+			pe->processes[my_i].next_process_ind = pe->first_process_ind;
+			pe->first_process_ind = my_i;
+			dprintf("%s: add to non-empty list as first\n",
+					__FUNCTION__);
+		}
+		/* After prev_i */
+		else {
+			pe->processes[my_i].next_process_ind =
+				pe->processes[prev_i].next_process_ind;
+			pe->processes[prev_i].next_process_ind = my_i;
+			dprintf("%s: add to non-empty list after PID %d\n",
+					__FUNCTION__, pe->processes[prev_i].pid);
+		}
+	}
+
+	next_i = -1;
+
+	/* Last process? Wake up first in list */
+	if (pe->nr_processes_left == 0) {
+		next_i = pe->first_process_ind;
+		pe->first_process_ind = pe->processes[next_i].next_process_ind;
+
+		pe->processes[next_i].ready = 1;
+		dprintf("%s: waking PID %d\n",
+				__FUNCTION__, pe->processes[next_i].pid);
+		pthread_cond_signal(&pe->processes[next_i].wait_cv);
+
+		/* Reset process counter */
+		pe->nr_processes_left = pe->nr_processes;
+		pe->process_rank = 0;
+	}
+
+	/* Wait for the rest if we aren't the next */
+	if (next_i != my_i) {
+		struct process_list_item *pli = &pe->processes[my_i];
+		struct timespec ts;
+
+		dprintf("%s: pid: %d, waiting in list\n",
+				__FUNCTION__, getpid());
+		/* Timeout period: 10 secs + (#procs * 0.1sec) */
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_sec += (5 + pe->nr_processes / 10);
+
+		ret = pthread_cond_timedwait(&pli->wait_cv,
+				&pe->lock, &ts);
+
+		/* First timeout task? Wake up everyone else,
+		 * but tell them we timed out */
+		if (ret == ETIMEDOUT) {
+			fprintf(stderr, "%s: error: pid: %d, timed out, waking everyone\n",
+					__FUNCTION__, getpid());
+			while (pe->first_process_ind != -1) {
+				struct process_list_item *pli_next =
+					&pe->processes[pe->first_process_ind];
+
+				pe->first_process_ind =
+					pe->processes[pe->first_process_ind].next_process_ind;
+				if (pli_next->pid == getpid())
+					continue;
+				dprintf("%s: pid: %d, waking next proc: %d\n",
+						__FUNCTION__, pli_next->pid);
+
+				pli_next->ready = 1;
+				pli_next->timeout = 1;
+				pthread_cond_signal(&pli_next->wait_cv);
+			}
+
+			/* Reset process counter to start state */
+			pe->nr_processes = -1;
+			ret = -ETIMEDOUT;
+
+			fprintf(stderr, "%s: error: pid: %d, woken everyone, out\n",
+					__FUNCTION__, getpid());
+			goto put_and_unlock_out;
+		}
+
+		/* Interrupted or woken up by someone else due to timeout? */
+		if (pli->timeout) {
+			fprintf(stderr, "%s: error: pid: %d, job startup timed out\n",
+					__FUNCTION__, getpid());
+			ret = -ETIMEDOUT;
+			goto put_and_unlock_out;
+		}
+
+		/* Incorrect wakeup state? */
+		if (!pli->ready) {
+			fprintf(stderr, "%s: error: pid: %d, not ready but woken?\n",
+					__FUNCTION__, getpid());
+			ret = -EINVAL;
+			goto put_and_unlock_out;
+		}
+
+		dprintf("%s: pid: %d, woken up\n",
+				__FUNCTION__, getpid());
+	}
+
+	--pe->nr_processes_left;
+#if 0
+
+	cpus_to_assign = udp->cpu_info->n_cpus / ppn;
+	cpus_used = kmalloc(sizeof(cpumask_t), GFP_KERNEL);
+	cpus_to_use = kmalloc(sizeof(cpumask_t), GFP_KERNEL);
+	if (!cpus_used || !cpus_to_use) {
+		fprintf(stderr, "%s: error: allocating cpu masks\n", __FUNCTION__);
+		ret = -ENOMEM;
+		goto put_and_unlock_out;
+	}
+	memcpy(cpus_used, &pe->cpus_used, sizeof(cpumask_t));
+	memset(cpus_to_use, 0, sizeof(cpumask_t));
+
+	/* Find the first unused CPU */
+	cpu = cpumask_next_zero(-1, cpus_used);
+	if (cpu >= udp->cpu_info->n_cpus) {
+		fprintf(stderr, "%s: error: no more CPUs available\n",
+				__FUNCTION__);
+		ret = -EINVAL;
+		goto put_and_unlock_out;
+	}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+	cpumask_set_cpu(cpu, cpus_used);
+	cpumask_set_cpu(cpu, cpus_to_use);
+#else
+	cpu_set(cpu, *cpus_used);
+	cpu_set(cpu, *cpus_to_use);
+#endif
+	cpu_prev = cpu;
+	dprintf("%s: CPU %d assigned (first)\n", __FUNCTION__, cpu);
+
+	for (cpus_assigned = 1; cpus_assigned < cpus_to_assign;
+			++cpus_assigned) {
+		int node;
+
+		cpu_top = NULL;
+		/* Find the topology object of the last core assigned */
+		list_for_each_entry(cpu_top_i, &udp->cpu_topology_list, chain) {
+			if (cpu_top_i->mckernel_cpu_id == cpu_prev) {
+				cpu_top = cpu_top_i;
+				break;
+			}
+		}
+
+		if (!cpu_top) {
+			fprintf(stderr, "%s: error: couldn't find CPU topology info\n",
+					__FUNCTION__);
+			ret = -EINVAL;
+			goto put_and_unlock_out;
+		}
+
+		/* Find a core sharing the same cache iterating caches from
+		 * the most inner one outwards */
+		list_for_each_entry(cache_top, &cpu_top->cache_list, chain) {
+			for_each_cpu(cpu, &cache_top->shared_cpu_map) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+				if (!cpumask_test_cpu(cpu, cpus_used)) {
+#else
+				if (!cpu_isset(cpu, *cpus_used)) {
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+					cpumask_set_cpu(cpu, cpus_used);
+					cpumask_set_cpu(cpu, cpus_to_use);
+#else
+					cpu_set(cpu, *cpus_used);
+					cpu_set(cpu, *cpus_to_use);
+#endif
+					cpu_prev = cpu;
+					dprintf("%s: CPU %d assigned (same cache L%lu)\n",
+						__FUNCTION__, cpu, cache_top->saved->level);
+					goto next_cpu;
+				}
+			}
+		}
+
+		/* No CPU? Find a core from the same NUMA node */
+		node = linux_numa_2_mckernel_numa(udp,
+				cpu_to_node(mckernel_cpu_2_linux_cpu(udp, cpu_prev)));
+
+		for_each_cpu_not(cpu, cpus_used) {
+			/* Invalid CPU? */
+			if (cpu >= udp->cpu_info->n_cpus)
+				break;
+
+			/* Found one */
+			if (node == linux_numa_2_mckernel_numa(udp,
+						cpu_to_node(mckernel_cpu_2_linux_cpu(udp, cpu)))) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+				cpumask_set_cpu(cpu, cpus_used);
+				cpumask_set_cpu(cpu, cpus_to_use);
+#else
+				cpu_set(cpu, *cpus_used);
+				cpu_set(cpu, *cpus_to_use);
+#endif
+				cpu_prev = cpu;
+				dprintf("%s: CPU %d assigned (same NUMA)\n",
+						__FUNCTION__, cpu);
+				goto next_cpu;
+			}
+		}
+
+		/* No CPU? Simply find the next unused one */
+		cpu = cpumask_next_zero(-1, cpus_used);
+		if (cpu >= udp->cpu_info->n_cpus) {
+			fprintf(stderr, "%s: error: no more CPUs available\n",
+					__FUNCTION__);
+			ret = -EINVAL;
+			goto put_and_unlock_out;
+		}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+		cpumask_set_cpu(cpu, cpus_used);
+		cpumask_set_cpu(cpu, cpus_to_use);
+#else
+		cpu_set(cpu, *cpus_used);
+		cpu_set(cpu, *cpus_to_use);
+#endif
+		cpu_prev = cpu;
+		dprintf("%s: CPU %d assigned (unused)\n",
+				__FUNCTION__, cpu);
+
+next_cpu:
+		continue;
+	}
+
+	/* Commit used cores to shared memory */
+	memcpy(&pe->cpus_used, cpus_used, sizeof(*cpus_used));
+
+#endif
+	/* Reset if last process */
+	if (pe->nr_processes_left == 0) {
+		dprintf("%s: nr_processes: %d (partitioned exec ends)\n",
+				__FUNCTION__,
+				pe->nr_processes);
+		pe->nr_processes = -1;
+		memset(&pe->cpus_used, 0, sizeof(pe->cpus_used));
+	}
+	/* Otherwise wake up next process in list */
+	else {
+		next_i = pe->first_process_ind;
+		pe->first_process_ind = pe->processes[next_i].next_process_ind;
+
+		pe->processes[next_i].ready = 1;
+		dprintf("%s: waking PID %d\n",
+				__FUNCTION__, pe->processes[next_i].pid);
+		pthread_cond_signal(&pe->processes[next_i].wait_cv);
+	}
+	dprintf("%s: rank: %d, ret: 0\n",
+			__FUNCTION__, pe->process_rank);
+	++pe->process_rank;
+
+	ret = 0;
+
+put_and_unlock_out:
+	//free(cpus_to_use);
+	//free(cpus_used);
+	pthread_mutex_unlock(&pe->lock);
+
+	return ret;
+}
+
 
 /*
  * main()
  */
+
+#define MPIPIN_MAGIC	(0xEEEEABCD)
+
 int main(int argc, char **argv)
 {
+	int error;
 	int ppn = 0;
 	int tpp = 0;
 	pid_t ppid;
 	int opt;
+	char shm_path[PATH_MAX];
+	int shm_fd;
+	void *shm;
+	int shm_created = 0;
+	struct stat st;
+	size_t shm_size;
+	struct part_exec *pe;
 
 	/* Parse options */
 	while ((opt = getopt_long(argc, argv, "n:p:t:", options, NULL)) != -1) {
@@ -685,8 +1068,16 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
+	dprintf("exec: %s\n", argv[optind]);
+
 	if (ppn == 0) {
 		fprintf(stderr, "error: you must specify the number of processes per node\n");
+		print_usage(argv);
+		exit(EXIT_FAILURE);	
+	}
+
+	if (ppn > MAX_PROCESSES) {
+		fprintf(stderr, "error: too many processes\n");
 		print_usage(argv);
 		exit(EXIT_FAILURE);	
 	}
@@ -696,8 +1087,9 @@ int main(int argc, char **argv)
 
 	ppid = getppid();
 
-	printf("[ppid: %d] ppn: %d, tpp: %d\n", ppid, ppn, tpp);
+	dprintf("[ppid: %d] ppn: %d, tpp: %d\n", ppid, ppn, tpp);
 
+#if 0
 	{
 		int error;
 		long size;
@@ -752,20 +1144,151 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+#endif
 
 	if (collect_topology() < 0) {
 		exit(EXIT_FAILURE);
 	}
 
-	printf("Topology information collected OK\n");
+	dprintf("Topology information collected OK\n");
+#if 0
 	{
 		struct node_topology *node_topo;
-		struct cpu_topology *cpu_topo;
+		struct cpu_topology *cpu_topo_iter;
+		struct cpu_topology *cpu_topo = NULL;
 		struct cache_topology *cache_topo;
 
+		list_for_each_entry(node_topo, &node_topology_list, list) {
+			int cpu;
+			printf("NUMA: %d\n", node_topo->node_number);
 
+			for (cpu = 0; cpu < get_nprocs_conf(); ++cpu) {
+				if (CPU_ISSET(cpu, &node_topo->cpumap)) {
+					printf("  CPU: %d\n", cpu);
+				}
 
+				list_for_each_entry(cpu_topo_iter, &cpu_topology_list, list) {
+					if (cpu_topo_iter->cpu_number == cpu) {
+						cpu_topo = cpu_topo_iter;
+						break;
+					}
+				}
+
+				if (!cpu_topo) {
+					fprintf(stderr, "no cpu_topo for %d??\n", cpu);
+					continue;
+				}
+
+				list_for_each_entry(cache_topo,
+						&cpu_topo->cache_topology_list, list) {
+					int scpu;
+
+					/*
+					if (strcmp(cache_topo->type, "Data")) {
+						continue;
+					}
+					*/
+
+					for (scpu = 0; scpu < get_nprocs_conf(); ++scpu) {
+						if (CPU_ISSET(scpu, &cache_topo->shared_cpu_map)) {
+							printf("    Cache level: %ld (type: %s), CPU: %d shared\n",
+								cache_topo->level,
+								cache_topo->type, scpu);
+						}
+					}
+				}
+			}
+		}
+	}
+#endif
+
+	/* Shared memory with other ranks */
+	sprintf(shm_path, "/mpipin.%d.shm", ppid);
+
+	shm_fd = shm_open(shm_path, O_RDWR | O_CREAT, 0700);
+	if (shm_fd < 0) {
+		fprintf(stderr, "error: opening shared memory file\n");
+		perror("");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
 	}
 
-	exit(0);
+	if (flock(shm_fd, LOCK_EX) < 0) {
+		fprintf(stderr, "error: locking shared memory\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
+
+	if (fstat(shm_fd, &st) < 0) {
+		fprintf(stderr, "error: stating shm file\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
+
+	dprintf("st_size: %lu\n", st.st_size);
+	shm_size = sizeof(struct part_exec);
+	if (st.st_size == 0) {
+		ftruncate(shm_fd, shm_size + PAGE_SIZE);
+		shm_created = 1;
+	}
+
+	shm = mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	if (shm == MAP_FAILED) {
+		fprintf(stderr, "error: mapping shared memory file\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
+
+	pe = (struct part_exec *)shm;
+
+	dprintf("shm @ %p %s\n", shm, shm_created ? "(created)" : "(attached)");
+
+	/* First process initializes shared memory variables */
+	if (shm_created) {
+		int pi;
+
+		memset(shm, 0, shm_size);
+
+		/* Cross-process mutex */
+		pthread_mutexattr_init(&pe->lock_attr);
+		pthread_mutexattr_setpshared(&pe->lock_attr, PTHREAD_PROCESS_SHARED);
+		pthread_mutex_init(&pe->lock, &pe->lock_attr);
+
+		for (pi = 0; pi < MAX_PROCESSES; ++pi) {
+			/*
+			pthread_mutexattr_init(&pe->processes[pi].wait_lock_attr);
+			pthread_mutexattr_setpshared(&pe->processes[pi].wait_lock_attr,
+					PTHREAD_PROCESS_SHARED);
+			pthread_mutex_init(&pe->processes[pi].wait_lock,
+					&pe->processes[pi].wait_lock_attr);
+			*/
+			pthread_condattr_init(&pe->processes[pi].wait_cv_attr);
+			pthread_condattr_setpshared(&pe->processes[pi].wait_cv_attr,
+					PTHREAD_PROCESS_SHARED);
+			pthread_cond_init(&pe->processes[pi].wait_cv,
+					&pe->processes[pi].wait_cv_attr);
+			pe->processes[pi].next_process_ind = -1;
+		}
+
+		pe->nr_processes = -1;
+		pe->nr_processes_left = -1;
+		pe->first_process_ind = -1;
+	}
+
+	if (flock(shm_fd, LOCK_UN) < 0) {
+		fprintf(stderr, "error: unlocking shared memory folder\n");
+		error = EXIT_FAILURE;
+		goto cleanup_shm;
+	}
+
+	/* We have the region, now wait for all processes and do the pin */
+	pin_process(pe, ppn);
+
+
+	error = 0;
+
+cleanup_shm:
+	shm_unlink(shm_path);
+
+	return error;
 }

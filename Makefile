@@ -1,6 +1,6 @@
 CC?=gcc
 CFLAGS=-O2 -Wall -Wextra -I./include -I./include/arch/x86/
-LDFLAGS=-lnuma
+LDFLAGS=-lnuma -lrt -lpthread
 
 BINS=mpipin
 
