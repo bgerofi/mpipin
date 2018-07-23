@@ -113,6 +113,12 @@ struct option options[] = {
 		.val =		't',
 	},
 	{
+		.name =		"cores-per-process",
+		.has_arg =	required_argument,
+		.flag =		NULL,
+		.val =		't',
+	},
+	{
 		.name =		"threads-per-process",
 		.has_arg =	required_argument,
 		.flag =		NULL,
@@ -1332,7 +1338,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Shouldn't reach here.. */
-	error = 0;
+	error = EXIT_FAILURE;
 
 cleanup_shm:
 	shm_unlink(shm_path);
