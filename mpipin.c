@@ -737,6 +737,7 @@ struct part_exec {
 	pthread_mutex_t lock;
 	int nr_processes;
 	int nr_processes_left;
+	int nr_processes_left_in_init;
 	int process_rank;
 	cpu_set_t cpus_used;
 	cpu_set_t cpus_available;
@@ -1072,7 +1073,14 @@ next_cpu:
 				__FUNCTION__);
 		ret = -EINVAL;
 		goto unlock_out;
-
+	}
+	else {
+		char cpu_list[PAGE_SIZE];
+		bitmap_scnlistprintf(cpu_list, sizeof(cpu_list),
+				(unsigned long *)&pe->affinities[pe->process_rank],
+				sizeof(cpu_set_t) * BITS_PER_BYTE);
+		dprintf("%s: rank: %d, bound to CPUs: %s\n",
+				__FUNCTION__, pe->process_rank, cpu_list);
 	}
 
 	++pe->process_rank;
@@ -1182,11 +1190,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: obtaining CPU affinity\n");
 		error = EXIT_FAILURE;
 		goto cleanup_shm;
-	}
-
-	/* Exclude excluded CPUs.. */
-	for_each_cpu(cpu, &cpus_excluded) {
-		CPU_CLR(cpu, &cpus_available);
 	}
 
 #if 0
@@ -1303,22 +1306,61 @@ int main(int argc, char **argv)
 		pe->nr_processes = -1;
 		pe->nr_processes_left = -1;
 		pe->first_process_ind = -1;
+		pe->nr_processes_left_in_init = ppn - 1;
 
 		memcpy(&pe->cpus_available, &cpus_available, sizeof(cpu_set_t));
-		pe->cpus_to_assign = CPU_COUNT(&pe->cpus_available) / ppn;
-		dprintf("%s: CPUs to assign: %d\n",
-				__FUNCTION__, pe->cpus_to_assign);
+	}
+	else {
+		/* Take union of allowed CPUs */
+		for_each_cpu(cpu, &cpus_available) {
+			CPU_SET(cpu, &pe->cpus_available);
+		}
+
+		--pe->nr_processes_left_in_init;
+		/* Last process discovers true CPU set available */
+		if (pe->nr_processes_left_in_init == 0) {
+			int cpu;
+
+			for (cpu = 0; cpu < get_nprocs_conf(); ++cpu) {
+				cpu_set_t target;
+
+				if (CPU_ISSET(cpu, &cpus_excluded)) {
+					continue;
+				}
+
+				if (CPU_ISSET(cpu, &pe->cpus_available)) {
+					dprintf("CPU %d is available\n", cpu);
+					continue;
+				}
+
+				/* Try to move */
+				memset(&target, 0, sizeof(target));
+				CPU_SET(cpu, &target);
+
+				if (sched_setaffinity(0, sizeof(cpu_set_t),
+							&target) < 0) {
+					continue;
+				}
+
+				if (sched_getcpu() == cpu) {
+					CPU_SET(cpu, &pe->cpus_available);
+					dprintf("CPU %d has been discovered as available\n", cpu);
+				}
+			}
+
+			/* Unset excluded CPUs.. */
+			for_each_cpu(cpu, &cpus_excluded) {
+				CPU_CLR(cpu, &pe->cpus_available);
+			}
+
+			pe->cpus_to_assign = CPU_COUNT(&pe->cpus_available) / ppn;
+			dprintf("%s: CPUs to assign: %d\n",
+					__FUNCTION__, pe->cpus_to_assign);
+		}
 	}
 
 	if (flock(shm_fd, LOCK_UN) < 0) {
 		fprintf(stderr, "error: unlocking shared memory folder\n");
-		error = EXIT_FAILURE;
-		goto cleanup_shm;
-	}
-
-	/* Check if we are pinned already */
-	if (memcmp(&cpus_available, &pe->cpus_available, sizeof(cpu_set_t))) {
-		fprintf(stderr, "error: CPU affinity already set (differs)\n");
 		error = EXIT_FAILURE;
 		goto cleanup_shm;
 	}
@@ -1332,6 +1374,7 @@ int main(int argc, char **argv)
 
 	shm_unlink(shm_path);
 
+	fflush(stdout);
 	if (execvp(argv[optind], &argv[optind]) < 0) {
 		fprintf(stderr, "error: executing %s\n", argv[optind]);
 		error = EXIT_FAILURE;
