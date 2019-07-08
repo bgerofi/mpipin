@@ -1,8 +1,9 @@
-CC?=gcc
-CFLAGS=-O2 -Wall -Wextra -I./include -I./include/arch/x86/
-LDFLAGS=-lnuma -lrt -lpthread
-
 BINS=mpipin
+ARCH=$(shell arch)
+
+CC?=gcc
+CFLAGS=-O2 -Wall -Wextra -I./include -I./include/arch/${ARCH}
+LDFLAGS=-lnuma -lrt -lpthread
 
 .PHONY: all clean
 all: $(BINS)

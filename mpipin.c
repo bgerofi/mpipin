@@ -515,12 +515,14 @@ static int collect_cache_topology(struct cpu_topology *cpu_topo, int index)
 		goto out;
 	}
 
+#ifndef __aarch64__
 	error = read_long(&p->physical_line_partition,
 			"%s/physical_line_partition", prefix);
 	if (error) {
 		fprintf(stderr, "%s: error: accessing sysfs\n", __FUNCTION__);
 		goto out;
 	}
+#endif
 
 	error = read_long(&p->ways_of_associativity,
 			"%s/ways_of_associativity", prefix);
