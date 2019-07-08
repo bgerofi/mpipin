@@ -1180,6 +1180,10 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);	
 	}
 
+	/* Unset common pinning environment variables */
+	setenv("MV2_ENABLE_AFFINITY", "0", 1);
+	setenv("I_MPI_PIN", "0", 1);
+
 	INIT_LIST_HEAD(&cpu_topology_list);
 	INIT_LIST_HEAD(&node_topology_list);
 
