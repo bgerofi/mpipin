@@ -148,6 +148,12 @@ struct option options[] = {
 		.flag =		NULL,
 		.val =		'e',
 	},
+	{
+		.name =		"help",
+		.has_arg =	no_argument,
+		.flag =		NULL,
+		.val =		0,
+	},
 	/* end */
 	{ NULL, 0, NULL, 0, },
 };
@@ -155,7 +161,20 @@ struct option options[] = {
 
 void print_usage(char **argv)
 {
-	printf("usage: %s <options> prog [args]\n", argv[0]);
+	printf("Usage: %s <options> prog [args]\n", argv[0]);
+	printf("Pin processes of a parallel application according to some policy.\n");
+	printf("\n");
+	printf("Mandatory arguments to long options are mandatory for short options too.\n");
+	printf("    --compact                   Lay out processes in a compact fashion.\n");
+	printf("    --scatter                   Lay out processes in a scattered fashion.\n");
+	printf("    -n, -p, --processes-per-node, --ranks-per-node,\n");
+	printf("    --ppn=PPN                   Number of processes per node.\n");
+	printf("    -t, --threads-per-processes, --cores-per-processes, \n");
+	printf("    --tpp=TPP                   Assign TPP logical CPUs per process.\n");
+	printf("    -e, --exclude-cpus=CPULIST  Exclude CPULIST logical CPUs from assignment.\n");
+	printf("\n");
+	printf("Example: \n");
+	printf("    mpirun -hostfile hosts -n N -ppn P mpipin -p P -t $OMP_NUM_THREADS --exclude-cpus 0-4 app arg1\n");
 }
 
 /*
@@ -1153,6 +1172,7 @@ int main(int argc, char **argv)
 				}
 				break;
 
+			case 'h':
 			default:
 				print_usage(argv);
 				exit(EXIT_FAILURE);
