@@ -1194,6 +1194,12 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);	
 	}
 
+	if (ppn == 1) {
+		fprintf(stderr, "error: processes per node must be at least 2\n");
+		fprintf(stderr, "(note: you don't need mpipin for a single rank per node, see numactl)\n");
+		exit(EXIT_FAILURE);
+	}
+
 	if (ppn > MAX_PROCESSES) {
 		fprintf(stderr, "error: too many processes\n");
 		print_usage(argv);
