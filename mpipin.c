@@ -93,6 +93,7 @@ static inline unsigned int cpuset_next(int n, const cpu_set_t *srcp)
 
 
 int compact = 1;
+int verbose = 0;
 struct option options[] = {
 	{
 		.name =		"compact",
@@ -153,6 +154,12 @@ struct option options[] = {
 		.has_arg =	no_argument,
 		.flag =		NULL,
 		.val =		0,
+	},
+	{
+		.name =		"verbose",
+		.has_arg =	no_argument,
+		.flag =		NULL,
+		.val =		'v',
 	},
 	/* end */
 	{ NULL, 0, NULL, 0, },
@@ -1104,9 +1111,8 @@ next_cpu:
 				__FUNCTION__, pe->process_rank, cpu_list);
 	}
 
+	ret = pe->process_rank;
 	++pe->process_rank;
-
-	ret = 0;
 
 unlock_out:
 	pthread_mutex_unlock(&pe->lock);
@@ -1130,6 +1136,7 @@ int main(int argc, char **argv)
 	int shm_fd;
 	int shm_created = 0;
 	int cpu;
+	int node_rank = 0;
 	pid_t ppid;
 	void *shm;
 	struct stat st;
@@ -1142,7 +1149,7 @@ int main(int argc, char **argv)
 	memset(&cpus_excluded, 0, sizeof(cpu_set_t));
 
 	/* Parse options */
-	while ((opt = getopt_long(argc, argv, "+n:p:t:e:", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "+n:p:t:e:vh", options, NULL)) != -1) {
 		char *tmp;
 
 		switch (opt) {
@@ -1170,6 +1177,10 @@ int main(int argc, char **argv)
 					fprintf(stderr, "error: parsing excluded CPU list\n");
 					exit(EXIT_FAILURE);
 				}
+				break;
+
+			case 'v':
+				verbose = 1;
 				break;
 
 			case 'h':
@@ -1398,13 +1409,31 @@ int main(int argc, char **argv)
 	}
 
 	/* We have the region, now wait for all processes and do the pin */
-	if (pin_process(pe, ppn) < 0) {
+	if ((node_rank = pin_process(pe, ppn)) < 0) {
 		fprintf(stderr, "error: pinning\n");
 		error = EXIT_FAILURE;
 		goto cleanup_shm;
 	}
 
 	shm_unlink(shm_path);
+
+	if (verbose) {
+		char mask[1024];
+		char host[512];
+
+		/* Get affinity */
+		if (sched_getaffinity(0, sizeof(cpu_set_t), &cpus_available) == -1) {
+			fprintf(stderr, "error: obtaining CPU affinity\n");
+			error = EXIT_FAILURE;
+			goto cleanup_shm;
+		}
+
+		gethostname(host, sizeof(host));
+		bitmap_scnlistprintf(mask, sizeof(mask),
+				(const long unsigned int *)&cpus_available,
+				sizeof(cpu_set_t) * BITS_PER_BYTE);
+		printf("process %d @ %s pinned to CPU(s): %s\n", node_rank, host, mask);
+	}
 
 	fflush(stdout);
 	if (execvp(argv[optind], &argv[optind]) < 0) {
